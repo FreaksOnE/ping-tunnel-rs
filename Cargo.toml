@@ -6,31 +6,31 @@ authors = ["FreaksOnE"]
 description = "ICMP-based tunnel"
 license = "MIT"
 repository = "https://github.com/FreaksOnE/ping-tunnel-rs"
-keywords = ["tcp", "udp", "icmp", "ping", "network", "tun", "tunnel"]
-categories = ["network-programming"]
+keywords = ["icmp", "tunnel", "tun", "ping", "network"]
+categories = ["network-programming", "command-line-utilities", "cryptography", "asynchronous"]
 readme = "README.md"
 
 [dependencies]
-tracing = { version = "0.1", features = ["attributes"] }
-tracing-subscriber = { version = "0.3", features = ["tracing-log", "env-filter"] }
-tracing-appender = "0.2"
-human-panic = "2.0"
+tracing = { version = "0.1.44", features = ["attributes"] }
+tracing-subscriber = { version = "0.3.23", features = ["tracing-log", "env-filter"] }
+tracing-appender = "0.2.5"
+human-panic = "2.0.8"
 anyhow = "1.0.104"
-thiserror = "2.0.19"
-clap = { version = "4.6.2", features = ["derive"] }
-tokio = { version = "1.53.0", features = ["full"] }
-futures = "0.3.33"
+thiserror = "2.0.21"
+clap = { version = "4.6.7", features = ["derive"] }
+tokio = { version = "1.53.3", features = ["full"] }
+futures = "0.3.34"
 
-tun-rs = { version = "2.8.7", features = ["async_tokio", "async_framed"] }
+tun-rs = { version = "2.8.12", features = ["async_tokio", "async_framed"] }
 bytes = "1.12.1"
 socket2 = "0.6.5"
-etherparse = "0.20.3"
-fastrand = "2.4"
-chacha20poly1305 = { version = "0.11", features = ["arrayvec", "getrandom"] }
-rand = "0.10.2"
+etherparse = "0.21.0"
+fastrand = "2.5.0"
+chacha20poly1305 = { version = "0.11.0", features = ["arrayvec", "getrandom"] }
+rand = "0.10.3"
 uuid = "1.24.0"
-sha2 = "0.10"
-hkdf = "0.12"
+sha2 = "0.11.1"
+hkdf = "0.13.0"
 
 [features]
 default = []

@@ -172,8 +172,11 @@ impl Server {
     pub async fn run(&self) -> Result<()> {
         let _guard = SysctlGuard::suppress_echo_replies()?;
 
-        let transport =
-            IcmpTransport::server(self.listen_ip, self.icmp_identifier, self.outer_mtu)?;
+        let transport = IcmpTransport::server(
+            self.listen_ip,
+            self.icmp_identifier,
+            self.outer_mtu,
+        )?;
         let (icmp_sender, mut icmp_receiver) = transport.setup()?;
         let icmp_sender = Arc::new(icmp_sender);
 
@@ -181,7 +184,8 @@ impl Server {
             Arc::new(RwLock::new(SessionTable::default()));
 
         let mut tasks: Vec<JoinHandle<()>> = Vec::new();
-        let tun = tun_open(&self.tun_name, self.outer_mtu, SERVER_TUN_IP).await?;
+        let tun =
+            tun_open(&self.tun_name, self.outer_mtu, SERVER_TUN_IP).await?;
         let framed_write =
             DeviceFramedWrite::new(Arc::clone(&tun), BytesCodec::new());
 
@@ -200,14 +204,19 @@ impl Server {
             mpsc::channel::<(Ipv4Addr, BytesMut)>(DATA_CHANNEL_CAPACITY);
 
         tasks.push(tokio::spawn(channel_to_tun(framed_write, to_tun_rx)));
-        tasks.push(tokio::spawn(tun_to_channel(SERVER_TUN_IP, tun, to_icmp_tx)));
+        tasks.push(tokio::spawn(tun_to_channel(
+            SERVER_TUN_IP,
+            tun,
+            to_icmp_tx,
+        )));
         tasks.push(tokio::spawn(server_tun_to_icmp(
             to_icmp_rx,
             Arc::clone(&icmp_sender),
             Arc::clone(&sessions),
         )));
 
-        let mut sweep = tokio::time::interval(sweep_interval(self.session_timeout));
+        let mut sweep =
+            tokio::time::interval(sweep_interval(self.session_timeout));
         sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
         loop {

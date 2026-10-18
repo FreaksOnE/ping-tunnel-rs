@@ -100,6 +100,7 @@ impl IcmpTransport {
             );
         }
 
+        #[allow(deprecated)]
         let socket_fd = Arc::new(
             AsyncFd::new(socket).map_err(TransportError::SocketCreate)?,
         );
