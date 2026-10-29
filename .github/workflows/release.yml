@@ -1,4 +1,5 @@
 name: Build Releases
+
 on:
   push:
     tags:
@@ -7,12 +8,19 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   build-linux:
     runs-on: ubuntu-latest
-    env:
-      RUST_BACKTRACE: full
+    timeout-minutes: 60
     strategy:
+      fail-fast: false
       matrix:
         target:
           - x86_64-unknown-linux-gnu
@@ -32,23 +40,35 @@ jobs:
 
     steps:
       - uses: actions/checkout@v7
-      - uses: actions-rs/toolchain@v1
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cross
+        uses: taiki-e/install-action@v2
         with:
-          toolchain: stable
-          target: ${{ matrix.target }}
-          override: true
-      - uses: actions-rs/cargo@v1
+          tool: cross
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
         with:
-          use-cross: true
-          command: build
-          args: --release --target ${{ matrix.target }}
-      - name: Compress
+          key: ${{ matrix.target }}
+
+      - name: Build
+        run: cross build --release --target ${{ matrix.target }}
+
+      - name: Package
         run: |
           cd target/${{ matrix.target }}/release
-          zip ping-tunnel-rs_${{ matrix.target }}.zip ping-tunnel-rs
+          zip ping-tunnel-rs_${{ github.ref_name }}_${{ matrix.target }}.zip ping-tunnel-rs
+          sha256sum ping-tunnel-rs_${{ github.ref_name }}_${{ matrix.target }}.zip \
+            > ping-tunnel-rs_${{ github.ref_name }}_${{ matrix.target }}.zip.sha256
 
-      - name: Upload Github Assets
+      - name: Upload release assets
         uses: softprops/action-gh-release@v3
         with:
-          files: target/${{ matrix.target }}/release/*.zip
-          prerelease: ${{ contains(github.ref, '-') }}
+          files: |
+            target/${{ matrix.target }}/release/*.zip
+            target/${{ matrix.target }}/release/*.sha256
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          generate_release_notes: true
