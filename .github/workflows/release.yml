@@ -48,7 +48,7 @@ jobs:
           zip ping-tunnel-rs_${{ matrix.target }}.zip ping-tunnel-rs
 
       - name: Upload Github Assets
-        uses: softprops/action-gh-release@v1
+        uses: softprops/action-gh-release@v3
         with:
           files: target/${{ matrix.target }}/release/*.zip
           prerelease: ${{ contains(github.ref, '-') }}
