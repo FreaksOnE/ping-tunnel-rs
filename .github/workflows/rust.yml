@@ -1,20 +1,42 @@
-name: Rust
+name: Rust CI
 
-on: [push, pull_request]
+on:
+  push:
+    branches: [main]
+  pull_request:
 
 env:
   CARGO_TERM_COLOR: always
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  build-linux:
+  check:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
 
     steps:
       - uses: actions/checkout@v7
-      - uses: actions-rs/toolchain@v1
-        with:
-          toolchain: stable
-      - name: Run lint
-        run: cargo clippy --verbose
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Format check
+        run: cargo fmt --all --check
+
+      - name: Lint
+        run: cargo clippy --all-targets -- -D warnings
+
       - name: Build
-        run: cargo build --verbose
+        run: cargo build --locked
+
+      - name: Test
+        run: cargo test --locked
