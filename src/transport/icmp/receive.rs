@@ -9,20 +9,22 @@ use socket2::Socket;
 use tokio::io::unix::AsyncFd;
 use tun_rs::IDEAL_BATCH_SIZE;
 
+use super::EchoMeta;
 use crate::error::TransportError;
 
 /// Largest datagram a raw IPv4 socket can deliver: the maximum IPv4 packet of
 /// 65,535 bytes (header included, since raw sockets deliver the whole packet).
 const READ_SCRATCH_LEN: usize = 65_535;
 
-/// Raw ICMP socket receiver that filters by ICMP type and tunnel identifier.
+/// Raw ICMP socket receiver that filters by ICMP type.
 ///
-/// Incoming packets are filtered in userspace by ICMP type and by the
-/// tunnel's 16-bit identifier to discard stray ICMP traffic.
+/// Incoming packets are filtered in userspace by ICMP type only; the echo
+/// identifier is reported to the caller ([`EchoMeta`]) instead of matched,
+/// because NAT gateways rewrite it in transit (it is ICMP's port equivalent).
+/// Stray traffic is discarded later, by the encrypted packet layers.
 #[derive(Debug)]
 pub struct IcmpReceiver {
     socket: Arc<AsyncFd<Socket>>,
-    identifier: u16,
     icmp_type: u8, // TYPE_ECHO_REPLY, TYPE_ECHO_REQUEST
     outer_mtu: u16,
     /// Read scratch, allocated once and reused by [`IcmpReceiver::recv_many`].
@@ -32,13 +34,11 @@ pub struct IcmpReceiver {
 impl IcmpReceiver {
     pub fn new(
         socket: Arc<AsyncFd<Socket>>,
-        identifier: u16,
         icmp_type: u8,
         outer_mtu: u16,
     ) -> Result<Self, TransportError> {
         Ok(Self {
             socket,
-            identifier,
             icmp_type,
             outer_mtu,
             scratch: BytesMut::zeroed(READ_SCRATCH_LEN),
@@ -46,16 +46,15 @@ impl IcmpReceiver {
     }
 }
 
-/// Extracts the ICMP echo payload from one raw IPv4 datagram.
+/// Extracts the ICMP echo payload and header fields from one raw IPv4 datagram.
 ///
-/// Returns the payload only when the IPv4 and ICMP headers parse, the ICMP type
-/// and echo identifier match, and the payload is non-empty. Every rejection is
-/// logged at trace level and yields `None`.
-fn parse_echo(
-    data: &[u8],
-    expected_type: u8,
-    expected_id: u16,
-) -> Option<&[u8]> {
+/// Returns the payload together with the echo identifier/sequence when the
+/// IPv4 and ICMP headers parse, the ICMP type matches, and the payload is
+/// non-empty. The identifier is reported, not matched: NAT gateways rewrite it
+/// in transit, so filtering on the configured value would drop every packet
+/// that crosses a NAT. Every rejection is logged at trace level and yields
+/// `None`.
+fn parse_echo(data: &[u8], expected_type: u8) -> Option<(&[u8], EchoMeta)> {
     let ip_slice = match Ipv4HeaderSlice::from_slice(data) {
         Ok(s) => s,
         Err(e) => {
@@ -84,15 +83,10 @@ fn parse_echo(
     }
 
     let b5to8 = icmp_slice.bytes5to8();
-    let recv_id = u16::from_be_bytes([b5to8[0], b5to8[1]]);
-    if recv_id != expected_id {
-        tracing::trace!(
-            expected = format_args!("{:#06x}", expected_id),
-            got = format_args!("{:#06x}", recv_id),
-            "ICMP identifier mismatch, skipping"
-        );
-        return None;
-    }
+    let meta = EchoMeta {
+        id: u16::from_be_bytes([b5to8[0], b5to8[1]]),
+        seq: u16::from_be_bytes([b5to8[2], b5to8[3]]),
+    };
 
     let payload = icmp_slice.payload();
     if payload.is_empty() {
@@ -100,13 +94,13 @@ fn parse_echo(
         return None;
     }
 
-    Some(payload)
+    Some((payload, meta))
 }
 
 impl IcmpReceiver {
     pub async fn recv(
         &mut self,
-    ) -> Result<(BytesMut, Ipv4Addr), TransportError> {
+    ) -> Result<(BytesMut, Ipv4Addr, EchoMeta), TransportError> {
         // Heap buffers allocated once per call and reused for every skipped
         // datagram; the kernel can deliver a datagram of any size and nothing
         // is dropped or truncated for size.
@@ -129,14 +123,11 @@ impl IcmpReceiver {
                 .await
                 .map_err(TransportError::Recv)?;
 
-            let payload = match parse_echo(
-                &scratch[..n_bytes],
-                self.icmp_type,
-                self.identifier,
-            ) {
-                Some(payload) => payload,
-                None => continue,
-            };
+            let (payload, meta) =
+                match parse_echo(&scratch[..n_bytes], self.icmp_type) {
+                    Some(parsed) => parsed,
+                    None => continue,
+                };
 
             let src_ip = match src_addr.as_socket_ipv4() {
                 Some(addr) => *addr.ip(),
@@ -150,17 +141,17 @@ impl IcmpReceiver {
 
             output.clear();
             output.extend_from_slice(payload);
-            return Ok((output, src_ip));
+            return Ok((output, src_ip, meta));
         }
     }
 
     /// Drains parsed datagrams into `out`, one readiness wakeup per call.
     ///
-    /// With the `AsyncFd` readiness guard held, `recv` runs until it returns
-    /// `WouldBlock` (socket drained) or [`IDEAL_BATCH_SIZE`] datagrams have been
-    /// read: N syscalls per wakeup instead of one wakeup + one syscall per
-    /// datagram. Parse failures and non-IPv4 sources are skipped inside the
-    /// batch and do not consume its budget beyond the read itself.
+    /// With the `AsyncFd` readiness guard held, `recv_many` runs until it
+    /// returns `WouldBlock` (socket drained) or [`IDEAL_BATCH_SIZE`] datagrams
+    /// have been read: N syscalls per wakeup instead of one wakeup + one
+    /// syscall per datagram. Parse failures and non-IPv4 sources are skipped
+    /// inside the batch and do not consume its budget beyond the read itself.
     ///
     /// `out` is appended to (callers clear it between batches). Each returned
     /// payload owns a fresh buffer because it moves into the caller's channel;
@@ -168,7 +159,7 @@ impl IcmpReceiver {
     /// the caller, which logs and continues.
     pub async fn recv_many(
         &mut self,
-        out: &mut Vec<(BytesMut, Ipv4Addr)>,
+        out: &mut Vec<(BytesMut, Ipv4Addr, EchoMeta)>,
     ) -> Result<(), TransportError> {
         let scratch = &mut self.scratch;
         let mut guard =
@@ -194,14 +185,11 @@ impl IcmpReceiver {
             };
             drained += 1;
 
-            let payload = match parse_echo(
-                &scratch[..n_bytes],
-                self.icmp_type,
-                self.identifier,
-            ) {
-                Some(payload) => payload,
-                None => continue,
-            };
+            let (payload, meta) =
+                match parse_echo(&scratch[..n_bytes], self.icmp_type) {
+                    Some(parsed) => parsed,
+                    None => continue,
+                };
 
             let src_ip = match src_addr.as_socket_ipv4() {
                 Some(addr) => *addr.ip(),
@@ -213,7 +201,7 @@ impl IcmpReceiver {
                 }
             };
 
-            out.push((BytesMut::from(payload), src_ip));
+            out.push((BytesMut::from(payload), src_ip, meta));
         }
         Ok(())
     }
@@ -253,21 +241,29 @@ mod tests {
     #[test]
     fn test_parse_echo_valid() {
         let packet = echo_request(0xBEEF, b"abc");
-        assert_eq!(
-            parse_echo(&packet, TYPE_ECHO_REQUEST, 0xBEEF),
-            Some(&b"abc"[..])
-        );
+        let (payload, meta) =
+            parse_echo(&packet, TYPE_ECHO_REQUEST).expect("parsed");
+        assert_eq!(payload, &b"abc"[..]);
+        assert_eq!(meta.id, 0xBEEF);
+        assert_eq!(meta.seq, 1);
     }
 
     #[test]
-    fn test_parse_echo_rejects_wrong_identifier() {
-        let packet = echo_request(0xBEEF, b"abc");
-        assert_eq!(parse_echo(&packet, TYPE_ECHO_REQUEST, 0x0001), None);
+    fn test_parse_echo_reports_a_rewritten_identifier() {
+        // NAT gateways rewrite the echo identifier in transit (it is ICMP's
+        // port equivalent); the receiver must report what arrived instead of
+        // filtering on the configured value, or NATed peers become unreachable.
+        let packet = echo_request(0xA959, b"abc");
+        let (payload, meta) =
+            parse_echo(&packet, TYPE_ECHO_REQUEST).expect("parsed");
+        assert_eq!(payload, &b"abc"[..]);
+        assert_eq!(meta.id, 0xA959);
+        assert_eq!(meta.seq, 1);
     }
 
     #[test]
     fn test_parse_echo_rejects_truncated() {
         let packet = echo_request(0xBEEF, b"abc");
-        assert_eq!(parse_echo(&packet[..12], TYPE_ECHO_REQUEST, 0xBEEF), None);
+        assert_eq!(parse_echo(&packet[..12], TYPE_ECHO_REQUEST), None);
     }
 }

@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use std::net::Ipv4Addr;
 use std::sync::Arc;
 use std::sync::OnceLock;
+use std::sync::atomic::AtomicU16;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -28,6 +29,7 @@ use crate::constants::SERVER_TUN_IP;
 use crate::constants::SESSION_SWEEP_INTERVAL;
 use crate::error::EncryptionError;
 use crate::nat::NatGuard;
+use crate::transport::icmp::EchoMeta;
 use crate::transport::icmp::IcmpTransport;
 use crate::transport::icmp::open_packet;
 use crate::transport::icmp::seal_payload;
@@ -41,6 +43,12 @@ pub struct Session {
     pub key: [u8; 32],
     pub client_ip: Ipv4Addr,
     pub tun_octet: u8,
+    /// The echo identifier the client's packets carry as they arrive here.
+    /// NAT gateways rewrite the identifier in transit, so it is captured from
+    /// received traffic instead of configured: server-to-client datagrams must
+    /// carry it, or the client's NAT drops them. Atomic so the data plane can
+    /// refresh it through the shared read lock.
+    echo_id: AtomicU16,
     /// Milliseconds from [`activity_origin`] to the last packet received from
     /// this client. Atomic so the data plane can refresh it through the shared
     /// read lock: the per-packet path stays free of session-table writes.
@@ -52,18 +60,28 @@ impl Session {
         key: [u8; 32],
         client_ip: Ipv4Addr,
         tun_octet: u8,
+        echo_id: u16,
         now: Instant,
     ) -> Self {
         Self {
             key,
             client_ip,
             tun_octet,
+            echo_id: AtomicU16::new(echo_id),
             last_seen_ms: AtomicU64::new(millis_since_origin(now)),
         }
     }
 
     fn touch(&self, now: Instant) {
         self.last_seen_ms.store(millis_since_origin(now), Ordering::Relaxed);
+    }
+
+    fn echo_id(&self) -> u16 {
+        self.echo_id.load(Ordering::Relaxed)
+    }
+
+    fn set_echo_id(&self, id: u16) {
+        self.echo_id.store(id, Ordering::Relaxed);
     }
 
     fn idle_for(&self, now: Instant) -> Duration {
@@ -238,11 +256,17 @@ impl Server {
                             idle_timeout_secs = self.session_timeout.as_secs(),
                             "dropping session after client inactivity; client must re-authenticate"
                         );
-                        send_session_expired(&icmp_sender, session.client_ip, &session.key).await;
+                        send_session_expired(
+                            &icmp_sender,
+                            session.client_ip,
+                            &session.key,
+                            EchoMeta::random_seq(session.echo_id()),
+                        )
+                        .await;
                     }
                 }
                 result = icmp_receiver.recv() => {
-                    let (mut buf, src_addr) = match result {
+                    let (mut buf, src_addr, echo) = match result {
                         Ok(v) => v,
                         Err(e) => {
                             tracing::warn!(error = %e, "icmp receive failed");
@@ -269,6 +293,10 @@ impl Server {
                                     let inner = open_packet(&mut buf, &session.key, None);
                                     if inner.is_ok() {
                                         session.touch(Instant::now());
+                                        // Server-to-client datagrams must carry the
+                                        // identifier this packet arrived with, or the
+                                        // client's NAT drops them.
+                                        session.set_echo_id(echo.id);
                                     }
                                     Some(inner)
                                 }
@@ -303,7 +331,8 @@ impl Server {
                                 client_ip = %src_addr,
                                 "rejecting packet for a session that is gone; client must re-authenticate"
                             );
-                            send_session_expired(&icmp_sender, src_addr, key).await;
+                            send_session_expired(&icmp_sender, src_addr, key, echo)
+                                .await;
                             continue;
                         }
                     }
@@ -318,8 +347,13 @@ impl Server {
 
                     match outcome {
                         Ok(Some(grant)) => {
-                            let session =
-                                Session::new(grant.key, src_addr, grant.tun_octet, Instant::now());
+                            let session = Session::new(
+                                grant.key,
+                                src_addr,
+                                grant.tun_octet,
+                                echo.id,
+                                Instant::now(),
+                            );
                             let replaced = guard
                                 .insert(grant.client_id.clone(), session, grant.tun_octet)
                                 .is_some();
@@ -333,7 +367,9 @@ impl Server {
                             );
                             match auth::build_auth_response(&grant.key, grant.tun_octet) {
                                 Ok(response) => {
-                                    if let Err(e) = icmp_sender.send(src_addr, &response).await {
+                                    if let Err(e) =
+                                        icmp_sender.send_as(src_addr, echo, &response).await
+                                    {
                                         tracing::warn!(error = %e, "auth response send failed");
                                     }
                                 }
@@ -351,7 +387,10 @@ impl Server {
                             // full): reject so the client can tell "rejected" from
                             // "server gone". No key at all is a silent drop.
                             match auth::trial_decrypt_key(&buf, &self.allowlist) {
-                                Some(key) => send_auth_reject(&icmp_sender, src_addr, &key).await,
+                                Some(key) => {
+                                    send_auth_reject(&icmp_sender, src_addr, &key, echo)
+                                        .await
+                                }
                                 None => {
                                     tracing::trace!(client_ip = %src_addr, "dropping datagram: no session and no matching key");
                                 }
@@ -381,12 +420,14 @@ async fn send_auth_reject(
     icmp_sender: &IcmpSender,
     client_ip: Ipv4Addr,
     key: &[u8; 32],
+    meta: EchoMeta,
 ) {
     send_notice(
         icmp_sender,
         client_ip,
         "auth reject",
         auth::build_auth_reject(key),
+        meta,
     )
     .await;
 }
@@ -395,12 +436,14 @@ async fn send_session_expired(
     icmp_sender: &IcmpSender,
     client_ip: Ipv4Addr,
     key: &[u8; 32],
+    meta: EchoMeta,
 ) {
     send_notice(
         icmp_sender,
         client_ip,
         "session-expiry notice",
         auth::build_session_expired(key),
+        meta,
     )
     .await;
 }
@@ -410,10 +453,11 @@ async fn send_notice(
     client_ip: Ipv4Addr,
     what: &'static str,
     frame: Result<BytesMut, EncryptionError>,
+    meta: EchoMeta,
 ) {
     match frame {
         Ok(frame) => {
-            if let Err(e) = icmp_sender.send(client_ip, &frame).await {
+            if let Err(e) = icmp_sender.send_as(client_ip, meta, &frame).await {
                 tracing::warn!(error = %e, %client_ip, what, "control frame send failed");
             }
         }
@@ -445,18 +489,26 @@ async fn server_tun_to_icmp(
             let guard = sessions.read().await;
             guard.client_for_octet(dst_ip.octets()[3]).and_then(|client_id| {
                 guard.sessions.get(client_id).map(|session| {
-                    (*client_id.0.as_bytes(), session.key, session.client_ip)
+                    (
+                        *client_id.0.as_bytes(),
+                        session.key,
+                        session.client_ip,
+                        session.echo_id(),
+                    )
                 })
             })
         };
-        let Some((client_id_bytes, key, client_ip)) = route else {
+        let Some((client_id_bytes, key, client_ip, echo_id)) = route else {
             tracing::trace!(%dst_ip, "no session for inner destination");
             continue;
         };
 
         match seal_payload(&packet, &key, client_id_bytes) {
             Ok(sealed) => {
-                if let Err(e) = icmp_sender.send(client_ip, &sealed).await {
+                if let Err(e) = icmp_sender
+                    .send_as(client_ip, EchoMeta::random_seq(echo_id), &sealed)
+                    .await
+                {
                     tracing::warn!(error = %e, "icmp send failed");
                 }
             }
@@ -490,7 +542,13 @@ mod tests {
     }
 
     fn session_at(octet: u8, now: Instant) -> Session {
-        Session::new([octet; 32], Ipv4Addr::new(203, 0, 113, octet), octet, now)
+        Session::new(
+            [octet; 32],
+            Ipv4Addr::new(203, 0, 113, octet),
+            octet,
+            u16::from(octet),
+            now,
+        )
     }
 
     fn session(octet: u8) -> Session {
@@ -521,6 +579,17 @@ mod tests {
             session.idle_for(now + Duration::from_secs(1)),
             Duration::from_secs(1)
         );
+    }
+
+    #[test]
+    fn test_session_tracks_the_arriving_echo_identifier() {
+        // The identifier is captured from received traffic (NAT rewrites it),
+        // and every server-to-client send must use the latest observed value.
+        let session = session(2);
+        assert_eq!(session.echo_id(), 2);
+
+        session.set_echo_id(0xA959);
+        assert_eq!(session.echo_id(), 0xA959);
     }
 
     #[test]

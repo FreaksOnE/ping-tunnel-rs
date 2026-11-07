@@ -9,6 +9,7 @@ use socket2::SockAddr;
 use socket2::Socket;
 use tokio::io::unix::AsyncFd;
 
+use super::EchoMeta;
 use crate::constants::DEFAULT_TTL;
 use crate::error::TransportError;
 
@@ -39,12 +40,31 @@ impl IcmpSender {
 }
 
 impl IcmpSender {
+    /// Sends with the configured identifier and a fresh random sequence.
     pub async fn send(
         &self,
         dest_ip: Ipv4Addr,
         payload: &BytesMut,
     ) -> Result<(), TransportError> {
-        let seq = fastrand::u16(..=u16::MAX);
+        self.send_as(
+            dest_ip,
+            EchoMeta { id: self.identifier, seq: fastrand::u16(..=u16::MAX) },
+            payload,
+        )
+        .await
+    }
+
+    /// Sends with an explicit echo identifier and sequence.
+    ///
+    /// Replies must reuse the identifier and sequence of the datagram that
+    /// prompted them (see [`EchoMeta`]): NAT gateways route ICMP by identifier,
+    /// so a reply carrying any other one is dropped before it reaches the peer.
+    pub async fn send_as(
+        &self,
+        dest_ip: Ipv4Addr,
+        meta: EchoMeta,
+        payload: &BytesMut,
+    ) -> Result<(), TransportError> {
         let ip_builder = PacketBuilder::ipv4(
             self.local_ip.octets(),
             dest_ip.octets(),
@@ -53,9 +73,9 @@ impl IcmpSender {
         // Build the role-correct ICMP echo type: the client sends echo requests and the
         // server sends echo replies, so the packet type follows the transport role.
         let builder = if self.icmp_type == TYPE_ECHO_REPLY {
-            ip_builder.icmpv4_echo_reply(self.identifier, seq)
+            ip_builder.icmpv4_echo_reply(meta.id, meta.seq)
         } else {
-            ip_builder.icmpv4_echo_request(self.identifier, seq)
+            ip_builder.icmpv4_echo_request(meta.id, meta.seq)
         };
 
         // get some memory to store the result

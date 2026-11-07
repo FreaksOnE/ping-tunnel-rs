@@ -181,10 +181,12 @@ impl Client {
             let reply = tokio::time::timeout(AUTH_TIMEOUT, async {
                 loop {
                     match receiver.recv().await {
-                        Ok((buf, src_addr)) if src_addr == self.server_ip => {
+                        Ok((buf, src_addr, _))
+                            if src_addr == self.server_ip =>
+                        {
                             break Ok(buf);
                         }
-                        Ok((_, src_addr)) => {
+                        Ok((_, src_addr, _)) => {
                             tracing::trace!(
                                 %src_addr,
                                 "ignoring auth datagram from unexpected source"

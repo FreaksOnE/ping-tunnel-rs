@@ -29,6 +29,28 @@ use crate::error::TransportError;
 pub mod receive;
 pub mod send;
 
+/// Echo header fields (identifier and sequence) as they arrived on the wire.
+///
+/// NAT gateways rewrite the echo identifier in transit - it is ICMP's
+/// equivalent of a port - so the identifier a peer configured is not
+/// necessarily the one that arrives. Receivers report what they saw instead of
+/// filtering on the configured value, and replies must carry the received
+/// fields back: a reply with any other identifier does not match the NAT
+/// mapping and is dropped before it reaches the peer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EchoMeta {
+    pub id: u16,
+    pub seq: u16,
+}
+
+impl EchoMeta {
+    /// Meta for a datagram that is not a reply to a specific received packet:
+    /// `id` as the peer's path delivered it, with a fresh random sequence.
+    pub fn random_seq(id: u16) -> Self {
+        Self { id, seq: fastrand::u16(..=u16::MAX) }
+    }
+}
+
 pub struct IcmpTransport {
     pub listen_ip: Ipv4Addr,
     pub icmp_identifier: u16,
@@ -112,12 +134,8 @@ impl IcmpTransport {
             Arc::clone(&socket_fd),
         )?;
 
-        let icmp_receiver = IcmpReceiver::new(
-            socket_fd,
-            self.icmp_identifier,
-            self.recv_type,
-            self.outer_mtu,
-        )?;
+        let icmp_receiver =
+            IcmpReceiver::new(socket_fd, self.recv_type, self.outer_mtu)?;
 
         Ok((icmp_sender, icmp_receiver))
     }
@@ -244,7 +262,7 @@ pub async fn icmp_to_channel(
     expected_client_id: Option<[u8; 16]>,
 ) -> IcmpReceiveEnd {
     // Batch buffer reused across wakeups.
-    let mut batch: Vec<(BytesMut, Ipv4Addr)> =
+    let mut batch: Vec<(BytesMut, Ipv4Addr, EchoMeta)> =
         Vec::with_capacity(IDEAL_BATCH_SIZE);
 
     loop {
@@ -255,8 +273,9 @@ pub async fn icmp_to_channel(
         }
 
         // Drain-batch forward: every parsed payload of this wakeup goes into
-        // the channel; failures drop just that datagram.
-        for (mut buf, src_addr) in batch.drain(..) {
+        // the channel; failures drop just that datagram. The echo metadata is
+        // client-receive-only and ends here.
+        for (mut buf, src_addr, _) in batch.drain(..) {
             let inner = if let Some(key) = session_key.as_ref() {
                 match decode_inbound(&mut buf, key.as_ref(), expected_client_id)
                 {

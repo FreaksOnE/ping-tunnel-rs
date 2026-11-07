@@ -24,8 +24,10 @@ pub struct Arguments {
     #[arg(long, default_value = "tun0")]
     pub tun_name: String,
 
-    /// 16-bit tunnel discriminator placed in the ICMP identifier field.
-    /// All peers must use the same value. Must be non-zero.
+    /// 16-bit value written to the ICMP identifier field of outgoing echo
+    /// packets. NAT gateways rewrite the identifier in transit (it is ICMP's
+    /// port equivalent), so the peer echoes back the identifier it received
+    /// instead of filtering on this value: it need not match across peers.
     #[arg(long, default_value_t = 1)]
     pub icmp_identifier: u16,
 
